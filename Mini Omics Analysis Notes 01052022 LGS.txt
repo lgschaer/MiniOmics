@@ -1,0 +1,368 @@
+METAGENOME AND TRANSCRIPTOMICS WORKFLOW NOTES
+12/16/2021
+Laura Schaerer
+
+#Path to MG Files
+
+#This is where the metagenome files were copied from
+/data/home/datadrop/ReSource_Metagenome_120321/19358R/Fasts
+
+#copy the files to my partition
+cp /data/home/datadrop/ReSource_Metagenome_120321/19358R/Fastq/* /home/lgschaer/old/MiniOmics/Metagenomics/
+
+#manually move the files into a folder for each consortia
+
+#concatenate the files into a single fastq file for R1 and a single fast file for R2
+cat E2*R1.fastq.gz > Emma2_R1.fastq.gz
+cat E2*R2.fastq.gz > Emma2_R2.fastq.gz
+
+######### A rough outline for metagenome assembly and subsequent binning
+###### Enter the stuff without #s in front of it into the command line (as these are comments, of course)
+###### Note: as this was quickly aggregated from some notes I had lying around, there may be some errors
+###### Uses megahit for assembly, then bins with metabat, maxbin, and concoct and combines the results using DAStool
+###### Note x2: each of the component programs used here would like for you to cite them. Links to their pages included below:
+### https://github.com/voutcn/megahit
+### http://bowtie-bio.sourceforge.net/bowtie2/index.shtml
+### https://bitbucket.org/berkeleylab/metabat/src/master/
+### https://sourceforge.net/projects/maxbin2/
+### https://github.com/BinPro/CONCOCT
+### https://github.com/cmks/DAS_Tool
+### http://www.htslib.org/doc/#publications (not 100% sure on if samtools wants a cite or not)
+
+
+##### Installation
+### This will *probably* work to install everything into a new conda environment
+
+conda create --name binning python=3 megahit bowtie2 samtools metabat2 concoct das_tool bbmap
+y
+conda activate binning
+
+### If that doesn't work, packages can be installed individually with
+
+conda install -n binning PackageThatWouldn'tInstallHere
+
+
+
+###### Note x3: input file will (of course) need to be adapted to whatever your file is called
+#### you can EITHER replace every instance of ${label} in this guide with whatever you want your files to be called
+#### OR you can run this to set the ${label} variable to be the filename prefix you want, and the code will handle the rest
+#### you might need to rerun this command whenever you close a terminal session though
+
+label=Emma2
+echo ${label}
+reads=${label}.fq.gz
+echo ${reads}
+
+label=Laura1
+echo ${label}
+reads=${label}.fq.gz
+echo ${reads}
+
+# If things start getting angry, changing this to an unzipped .fastq may help
+# which can be done with the gunzip command
+
+##### This guide is for interleaved fastq files, but you should be able to interleave paired end using BBMap
+
+reformat.sh in1={YOUR_R1_INPUT}.fq.gz in2={YOUR_R2_INPUT}.fq.gz out=${label}.fq.gz
+reads=${label}.fq.gz
+
+reformat.sh in1=${label}_R1.fastq.gz in2=${label}_R2.fastq.gz out=${label}.fq.gz
+reads=${label}.fq.gz
+
+
+####### Many of the big commands (like megahit or metabat or dastool) have a bunch of additional optional command line arguments
+####### Sometimes tweaking commands with arguments can improve performance, but you'll need to read the documentation to figure out what to change and why if you want to try that
+
+####### Note x4: Many of these commands have their thread usage increased to *32*, which should hog up the entirety of the server's processing power
+####### if you don't want to do that, whenever you see the number *32* just change it to something a little bit smaller
+##### megahit read assembly
+
+screen megahit --12 ${reads} -o ${label} --k-step 10 -t 16 --out-prefix ${label}megahitout
+
+
+
+##### bowtie2 mapping
+### first need to index
+screen bowtie2-build ${label}.contigs.fa ${label} --threads 32
+
+### actual mapping step 
+screen bowtie2 -x ${label} --interleaved ../${reads} -p 32 -S ${label}Map.sam
+
+### samtools unfortunately doesn't like screen much if I recall correctly
+#turn sam into bam
+samtools view ${label}Map.sam -b > ${label}Map.bam
+
+#so that it can be sorted
+samtools sort -o ${label}sortmap.bam ${label}Map.bam
+
+samtools sort -o Laura1_sortmap.bam Laura1.bam
+samtools sort -o Emma2_sortmap.bam Emma2.bam
+
+
+#and indexed
+samtools index ${label}sortmap.bam  -b
+
+samtools index Laura1_sortmap.bam  -b
+samtools index Emma2_sortmap.bam  -b
+
+
+##### calculate contig depth
+### contig depth calculated by metabat script from indexed, sorted bam bowtie mapping 
+jgi_summarize_bam_contig_depths --outputDepth ${label}_depth.txt ${label}sortmap.bam
+
+jgi_summarize_bam_contig_depths --outputDepth Laura1_depth.txt Laura1sortmap.bam
+jgi_summarize_bam_contig_depths --outputDepth Emma2_depth.txt Emma2sortmap.bam
+
+
+##### run metabat binning
+
+screen metabat2 -i ${label}.contigs.fa -o Metabat2/${label}metabat -a ${label}_depth.txt
+
+
+##### Check completeness with CheckM
+
+https://anaconda.org/bioconda/checkm-genome
+conda install -c bioconda/label/cf201901 checkm-genome
+
+conda activate checkm
+
+mkdir CheckM
+
+checkm lineage_wf -t 32 -x fa Metabat2 CheckM --tab_table
+
+checkm analyze -t 32 -x fa CheckM/lineage.ms Metabat2/ CheckM/output_dir
+
+
+####### Using BAT/CAT to assign taxonomy
+
+conda create --name cat python=3 cat 
+conda activate cat
+
+#setting up taxonomy databases or use shared directories on the server
+
+
+CAT bins -b Metabat2/ -d /data/home/sharedDatabases/CAT/2021-01-07_CAT_database/ -t /data/home/sharedDatabases/CAT/2021-01-07_CAT_taxonomy/ -s .fa
+
+CAT add_names -i out.BAT.bin2classification.txt -o out.BAT.bin2classification_w_tax.txt  -t /data/home/sharedDatabases/CAT/2021-01-07_CAT_taxonomy/
+
+##### Using prokka to annotate genes
+
+conda create --name prokka python=3 prokka pandas seaborn ipykernel perl-bioperl==1.7.2
+conda activate prokka
+
+#start screen, activate prokka environment, then run the following command from inside the directory where the bin .fa files are. 
+
+for BIN in *.fa 
+do
+BINN=`echo $BIN | sed s/\.fa//`
+prokka --outdir prokka/$BINN/ --prefix $BINN --locustag $BINN --metagenome --cpu 16 $BINN.fa
+done
+
+##note: I did this for the contigs.fa file for each consortia AND the bins from Metabat2. 
+##contigs.fa *.ffn file was used for the transcriptomics indexing step.
+
+If you use Prokka in your work, please cite:
+
+  Seemann T, "Prokka: Rapid Prokaryotic Genome Annotation", 
+  Bioinformatics, 2014 Jul 15;30(14):2068-9.
+
+  PMID:24642063
+  doi:10.1093/bioinformatics/btu153
+  http://www.ncbi.nlm.nih.gov/pubmed/24642063
+    
+Thank you.
+
+
+#Path to MT Files
+
+/home/lgschaer/old/Transcriptomics/Emma2 OR /Laura1
+
+#install packages we will need
+
+###this did not work for me, I created the environment and then added packages one at a time
+conda create -n analysis -c bioconda -c conda-forge fastqc \ trimmomatic spades megahit quast \ bowtie2 java-jdk samtools muscle hmmer cufflinks-py tophat2 salmon --yes
+
+
+##### Installation
+### This will *probably* work to install everything into a new conda environment
+
+conda create --name transc 
+
+conda activate transc
+
+conda install -n transc fastqc
+conda install -n transc trimmomatic
+conda install -n transc spades
+conda install -n transc megahit
+conda install -n transc -c bioconda/label/cf201901 python=3.9 quast
+conda install -n transc -c bioconda/label/cf201901 python=3.9 bowtie2
+conda install -n transc java-jdk
+conda install -n transc samtools
+conda install -n transc muscle
+conda install -n transc hmmer
+conda install -n transc -c conda-forge/label/cf202003 cufflinks-py
+conda install -n transc -c conda-forge/label/cf202003 python=3.9 tophat2
+conda install -n transc salmon
+
+#check that all the packages are there!!
+conda list -n transc
+
+##note: I couldn't get quast and tophat2 to install, skipping those two for now. All other packages installed correctly using the code above
+
+#Starting analysis!!
+### using code here as a starting point: https://github.com/stechtmann/Techtmann_Lab_Code/blob/main/RNASeq.md 
+### running these commands from inside the directory where the transcriptomics fastq files are
+
+#check quality
+fastqc *.fastq.gz
+
+#quality trim with trimmomatic:
+##https://speciationgenomics.github.io/Trimmomatic/ and http://www.usadellab.org/cms/?page=trimmomatic are helpful
+
+trimmomatic PE -phred33 <fwd_input_file>.fastq.gz <rev_input_file>.fastq.gz trimmed/<fwd_output_paired_file>.fq.gz trimmed/<rev_output_paired_file>.fq.gz trimmed/<fwd_output_unpaired_file>.fq.gz trimmed/<rev_output_unpaired_file>.fq.gz ILLUMINACLIP:/PATH/TO/TRIMMOMATIC/FILES/trimmomatic-0.39-2/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+mkdir trimmed
+
+trimmomatic PE -phred33 L1_DCPET_TF_S45_R1_001.fastq.gz L1_DCPET_TF_S45_R2_001.fastq.gz trimmed/L1_DCPET_paired_R1.fq.gz trimmed/L1_DCPET_paired_R2.fq.gz trimmed/L1_DCPET_unpaired_R1.fq.gz trimmed/L1_DCPET_unpaired_R2.fq.gz ILLUMINACLIP:/home/lgschaer/miniconda2/envs/transc/share/trimmomatic-0.39-2/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+##this command works
+trimmomatic PE -phred33 L1_DCPET_TF_S45_R1_001.fastq.gz L1_DCPET_TF_S45_R2_001.fastq.gz trimmed/L1_DCPET_paired_R1.fq.gz trimmed/L1_DCPET_paired_R2.fq.gz trimmed/L1_DCPET_unpaired_R1.fq.gz trimmed/L1_DCPET_unpaired_R2.fq.gz ILLUMINACLIP:/home/lgschaer/miniconda2/envs/transc/share/trimmomatic-0.39-2/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+#trying to make things easier
+label=E2_EG
+echo ${label}
+file=${label}_TF_S51
+echo ${file}
+
+trimmomatic PE -phred33 ${file}_R1_001.fastq.gz ${file}_R2_001.fastq.gz trimmed/${label}_paired_R1.fq.gz trimmed/${label}_paired_R2.fq.gz trimmed/${label}_unpaired_R1.fq.gz trimmed/${label}_unpaired_R2.fq.gz ILLUMINACLIP:/home/lgschaer/miniconda2/envs/transc/share/trimmomatic-0.39-2/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+#Quantification
+
+##Reinstalling salmon in its own environment since I ran into issues
+conda create -n salmon salmon
+conda activate salmon
+
+mkdir quants
+
+/home/lgschaer/miniconda2/envs/salmon/bin/salmon index -t ../../Metagenomics/Laura1/Laura1/prokka/Laura1.contigs/*.ffn -i L1_full_index 
+
+mkdir ffn
+mv ../../Metagenomics/Emma2/Emma2/Metabat2/prokka/*/*.ffn ffn/
+
+/home/lgschaer/miniconda2/envs/salmon/bin/salmon index -t ../../Metagenomics/Emma2/Emma2/Metabat2/prokka/*/*.ffn -i E2_index 
+
+label=L1_EG
+echo ${label}
+
+/home/lgschaer/miniconda2/envs/salmon/bin/salmon quant -i L1_full_index -l A -1 trimmed/${label}_paired_R1.fq.gz -2 trimmed/${label}_paired_R2.fq.gz -p 8 --validateMappings -o  quants/${label}_quant --minAssignedFrags 1
+
+label=E2_TPA
+echo ${label}
+
+/home/lgschaer/miniconda2/envs/salmon/bin/salmon quant -i E2_full_index -l A -1 trimmed/${label}_paired_R1.fq.gz -2 trimmed/${label}_paired_R2.fq.gz -p 8 --validateMappings -o  quants/${label}_quant
+
+
+###Different transcriptomics approach
+
+conda create --name RNASeq
+conda install --name RNASeq -c bioconda bowtie2 htseq
+conda activate RNASeq
+
+bowtie2-build /home/lgschaer/old/MiniOmics/Metagenomics/Laura1/Laura1/prokka/Laura1.contigs/Laura1.contigs.fna Laura1_ref
+
+bowtie2-build /home/lgschaer/old/MiniOmics/Metagenomics/Emma2/Emma2/prokka/Emma2.contigs/Emma2.contigs.fna Emma2_ref
+
+
+#trim transcriptomics reads - do this for all transcriptomics fastq.gz files
+
+conda activate transc
+
+cd /home/lgschaer/old/MiniOmics/Transcriptomics/Laura1/
+
+#interleave transcriptomics files using bbmap
+
+conda activate binning
+
+label=E2_EG
+echo ${label}
+file=${label}_TF_S51
+echo ${file}
+
+reformat.sh in1=${file}_R1_001.fastq.gz in2=${file}_R2_001.fastq.gz out=${label}.fastq.gz
+
+
+conda deactivate
+conda activate transc
+
+label=L1_EG
+echo ${label}
+
+trimmomatic SE -phred33 ${label}.fastq.gz ${label}_trimmed.fastq.gz ILLUMINACLIP:/home/lgschaer/miniconda2/envs/transc/share/trimmomatic-0.39-2/adapters/TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+
+#map cleaned reads to the reference
+
+conda deactivate
+
+screen 
+conda activate RNASeq
+
+enrich=Emma2
+echo ${enrich}
+label=E2_EG
+echo ${label}
+
+
+bowtie2 -x ${enrich}_ref -U trimmed/${label}_trimmed.fastq.gz -S ${label}_map.sam
+
+
+#convert to gtf format
+
+###only need to install one time
+conda install -c bioconda -n RNASeq gffread
+
+conda activate RNASeq
+
+enrich=Emma2
+echo ${enrich}
+label=E2_TA
+echo ${label}
+
+gffread ../../Metagenomics/${enrich}/${enrich}/prokka/${enrich}.contigs/${enrich}.contigs.gff -T -o ${label}.gtf
+
+#count mapped reads
+
+mkdir counts
+
+screen
+conda activate RNASeq
+
+enrich=Emma2
+echo ${enrich}
+label=E2_EG
+echo ${label}
+
+htseq-count -t CDS  -i transcript_id ${label}_map.sam ${label}.gtf > counts/${label}_count.txt
+
+#to help with contigname/binID/locustag key
+
+conda activate cat
+
+CAT bins -b ../Contig_Bins/ -d /data/home/sharedDatabases/CAT/2021-01-07_CAT_database/ -t /data/home/sharedDatabases/CAT/2021-01-07_CAT_taxonomy/ -s .fa
+
+### More specific taxonomic classification with kraken
+
+conda create --yes -n kraken kraken2 bracken
+conda activate kraken
+
+folder=Laura1
+echo ${folder}
+
+cd /home/lgschaer/old/MiniOmics/Transcriptomics/${folder}
+mkdir kraken 
+
+file=L1_EG_TF_S46
+echo ${file}
+
+kraken2 --use-names --threads 4 -db /data/home/sharedDatabases/Braken/ --report ${file}.txt --gzip-compressed --paired ${file}_R1_001.fastq.gz ${file}_R2_001.fastq.gz > ${folder}.kraken
+bracken -d /data/home/sharedDatabases/Braken/ -i {folder} -l G -o ${folder}.bracken
+
